@@ -333,9 +333,18 @@ A day command — `today`, `tomorrow` or any weekday — answers with that day's
 classes first, then what is due, then exams, then anything posted to the
 course noticeboards that day. Sections with nothing in them are left out.
 
-Weekday names accept short forms (`mon`, `tues`, `thurs`) and mean the *next*
-such day, counting today as itself: asked on a Saturday, `sat` is today and
-`sun` is tomorrow.
+Weekday names accept short forms (`mon`, `tues`, `thurs`) and always look
+**past tomorrow** - `today` and `tomorrow` already cover those two days, so
+naming either one's weekday asks for the one a week out. Asked on a Monday:
+
+| Typed | Means |
+| --- | --- |
+| `monday` | next Monday, 7 days away |
+| `tuesday` | next week's Tuesday, 8 days away - for the one tomorrow, say `tomorrow` |
+| `wednesday` | this week's Wednesday, 2 days away |
+
+Every reply leads with the full date, so there is never any doubt which day
+came back.
 
 `refresh` is never bound by the overnight quiet window — that window applies
 only to the scheduled 45-minute cycle.

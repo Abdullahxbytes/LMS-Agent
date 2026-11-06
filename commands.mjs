@@ -123,18 +123,31 @@ const prettyPk = (iso) => new Intl.DateTimeFormat('en-GB', {
 const colIdx = (columns, name) =>
   (columns ?? []).findIndex((c) => String(c).trim().toLowerCase() === name);
 
-// The next occurrence of a weekday. Asking about the day you are standing in
-// means today, not the same day next week.
-function dateForDay(dayIndex, now = pkNow()) {
-  const ahead = (dayIndex - now.dayIndex + 7) % 7;
+// How many days ahead a request lands.
+//
+// 'exact' is the literal next occurrence, counting today as itself - what
+// `today` and `tomorrow` need.
+//
+// 'upcoming' is what a weekday NAME means. Today and tomorrow already have
+// their own commands, so naming either one's weekday is a request for the one
+// a week out: on a Monday, "monday" is next Monday and "tuesday" is next
+// week's Tuesday. From the day after tomorrow onwards it is simply this
+// week's - on a Monday, "wednesday" is two days away.
+export function dayOffset(dayIndex, todayIndex, mode = 'exact') {
+  const ahead = (dayIndex - todayIndex + 7) % 7;
+  return mode === 'upcoming' && ahead <= 1 ? ahead + 7 : ahead;
+}
+
+function dateForDay(dayIndex, mode = 'exact', now = pkNow()) {
+  const ahead = dayOffset(dayIndex, now.dayIndex, mode);
   const base = new Date(`${now.date}T00:00:00+05:00`);
   return { iso: isoPk(new Date(base.getTime() + ahead * 864e5)), ahead };
 }
 
 // Everything happening on one date: classes first, then what is due, then
 // exams, then anything posted to the course noticeboards that day.
-function dayReply(snapshot, dayIndex) {
-  const { iso, ahead } = dateForDay(dayIndex);
+function dayReply(snapshot, dayIndex, mode = 'exact') {
+  const { iso, ahead } = dateForDay(dayIndex, mode);
   const when = ahead === 0 ? 'today' : ahead === 1 ? 'tomorrow' : `in ${ahead} days`;
   const out = [`*${prettyPk(iso)}*  (${when})`];
 
@@ -290,8 +303,9 @@ export async function handleCommand(text, { snapshot, state, refresh } = {}) {
       if (!refresh) return 'Refresh is not available here.';
       return await refresh();
     default:
-      // A weekday name gives that day's classes, deadlines and announcements.
-      if (Object.hasOwn(DAY_ALIASES, cmd)) return dayReply(snapshot, DAY_ALIASES[cmd]);
+      // A weekday name gives that day's classes, deadlines and announcements,
+      // always looking forward past tomorrow.
+      if (Object.hasOwn(DAY_ALIASES, cmd)) return dayReply(snapshot, DAY_ALIASES[cmd], 'upcoming');
 
       // Not a command. The bot lives in a personal chat that also gets used
       // as a notepad - forwarded files, links, notes to self - so anything
