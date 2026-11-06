@@ -320,12 +320,25 @@ messaged you from).
 | `marks [course]` | marks with class averages; filter by code or name |
 | `attendance` | percentage per course, flags anything under 75% |
 | `due` | upcoming submission and assessment deadlines |
-| `today` / `tomorrow` | class schedule for that day |
+| `today` / `tomorrow` | everything on that day |
+| `monday` … `sunday` | everything on the next such day |
 | `exams` | final exam datesheet |
 | `fees` | unpaid challans |
 | `done [item]` | stop reminders for a deadline |
+| `login` | sign in again and refresh the session |
 | `cookie <value>` | replace the portal session id |
 | `refresh` | re-scrape the portal now |
+
+A day command — `today`, `tomorrow` or any weekday — answers with that day's
+classes first, then what is due, then exams, then anything posted to the
+course noticeboards that day. Sections with nothing in them are left out.
+
+Weekday names accept short forms (`mon`, `tues`, `thurs`) and mean the *next*
+such day, counting today as itself: asked on a Saturday, `sat` is today and
+`sun` is tomorrow.
+
+`refresh` is never bound by the overnight quiet window — that window applies
+only to the scheduled 45-minute cycle.
 
 ### Course names
 

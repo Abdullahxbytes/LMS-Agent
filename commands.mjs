@@ -96,13 +96,105 @@ function feesReply(snapshot) {
   return list.map((i) => `*${i.type}* ${i.term}\n${money(i.amount)} due ${i.dueDate}\nChallan ${i.id}`).join('\n\n');
 }
 
-function todayReply(snapshot, offsetDays = 0) {
-  const now = pkNow();
-  const dayIndex = (now.dayIndex + offsetDays + 7) % 7;
+const DAY_ALIASES = {
+  sun: 0, sunday: 0,
+  mon: 1, monday: 1,
+  tue: 2, tues: 2, tuesday: 2,
+  wed: 3, weds: 3, wednesday: 3,
+  thu: 4, thur: 4, thurs: 4, thursday: 4,
+  fri: 5, friday: 5,
+  sat: 6, saturday: 6,
+};
+
+// All three formatters are pinned to Pakistan time so the answer is the same
+// whatever the host clock is set to.
+const isoPk = (d) => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(d);
+
+const timePk = (d) => new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Karachi', hour: '2-digit', minute: '2-digit', hour12: true,
+}).format(d);
+
+const prettyPk = (iso) => new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Karachi', weekday: 'long', day: '2-digit', month: 'short',
+}).format(new Date(`${iso}T00:00:00+05:00`));
+
+const colIdx = (columns, name) =>
+  (columns ?? []).findIndex((c) => String(c).trim().toLowerCase() === name);
+
+// The next occurrence of a weekday. Asking about the day you are standing in
+// means today, not the same day next week.
+function dateForDay(dayIndex, now = pkNow()) {
+  const ahead = (dayIndex - now.dayIndex + 7) % 7;
+  const base = new Date(`${now.date}T00:00:00+05:00`);
+  return { iso: isoPk(new Date(base.getTime() + ahead * 864e5)), ahead };
+}
+
+// Everything happening on one date: classes first, then what is due, then
+// exams, then anything posted to the course noticeboards that day.
+function dayReply(snapshot, dayIndex) {
+  const { iso, ahead } = dateForDay(dayIndex);
+  const when = ahead === 0 ? 'today' : ahead === 1 ? 'tomorrow' : `in ${ahead} days`;
+  const out = [`*${prettyPk(iso)}*  (${when})`];
+
   const slots = slotsForDay(snapshot.timetable ?? [], dayIndex);
-  if (!slots.length) return offsetDays ? 'No classes tomorrow.' : 'No classes today.';
-  const label = slots[0].day;
-  return [`*${label}*`, ...slots.map((s) => `${s.start}-${s.end}  ${shortLabel(s)} (${s.kind})`)].join(NL);
+  if (slots.length) {
+    out.push('', '*Classes*');
+    for (const s of slots) out.push(`${s.start}-${s.end}  ${shortLabel(s)} (${s.kind})`);
+  }
+
+  const due = collectDeadlines(snapshot).filter((i) => isoPk(i.due) === iso);
+  if (due.length) {
+    out.push('', '*Due*');
+    for (const i of due) {
+      out.push(`*${abbreviate(i.course) || i.code}* - ${i.name}`);
+      out.push(timePk(i.due));
+    }
+  }
+
+  const exams = (snapshot.global?.datesheet ?? []).flatMap((t) => {
+    const iDate = colIdx(t.columns, 'date');
+    const iClass = colIdx(t.columns, 'class');
+    const iTime = colIdx(t.columns, 'time');
+    if (iDate < 0) return [];
+    return (t.rows ?? [])
+      .filter((r) => String(r[iDate] ?? '').trim() === iso)
+      .map((r) => ({ name: iClass >= 0 ? r[iClass] : '', time: iTime >= 0 ? r[iTime] : '' }));
+  });
+  if (exams.length) {
+    out.push('', '*Exams*');
+    for (const e of exams) out.push(`*${abbreviate(e.name) || e.name}* - ${e.time}`);
+  }
+
+  const notes = [];
+  for (const c of snapshot.courses ?? []) {
+    for (const t of c.tabs?.info ?? []) {
+      const iDate = colIdx(t.columns, 'date');
+      if (iDate < 0) continue;
+      const iSubject = colIdx(t.columns, 'subject');
+      const iDesc = colIdx(t.columns, 'description');
+      for (const r of t.rows ?? []) {
+        if (String(r[iDate] ?? '').trim() !== iso) continue;
+        notes.push({
+          code: c.code, course: c.name,
+          subject: iSubject >= 0 ? r[iSubject] : '',
+          desc: iDesc >= 0 ? String(r[iDesc] ?? '').trim() : '',
+        });
+      }
+    }
+  }
+  if (notes.length) {
+    out.push('', '*Announcements*');
+    for (const n of notes) {
+      out.push(`*${abbreviate(n.course) || n.code}* - ${n.subject}`);
+      if (n.desc) out.push(n.desc.length > 160 ? n.desc.slice(0, 157) + '...' : n.desc);
+    }
+  }
+
+  // Only the heading means the day is empty.
+  if (out.length === 1) out.push('', 'Nothing scheduled.');
+  return out.join(NL);
 }
 
 const NL = String.fromCharCode(10);
@@ -113,7 +205,8 @@ const HELP = [
   '*marks* [course] - with class averages',
   '*attendance* [course] - % per course',
   '*due* - upcoming deadlines',
-  '*today* / *tomorrow* - classes',
+  '*today* / *tomorrow* - the day ahead',
+  '*monday* ... *sunday* - any weekday',
   '*exams* - datesheet',
   '*fees* - unpaid challans',
   '*done* [item] - stop reminders',
@@ -184,9 +277,9 @@ export async function handleCommand(text, { snapshot, state, refresh } = {}) {
     case 'fee': case 'fees': case 'invoice': case 'invoices': case 'challan':
       return feesReply(snapshot);
     case 'today':
-      return todayReply(snapshot, 0);
+      return dayReply(snapshot, pkNow().dayIndex);
     case 'tomorrow':
-      return todayReply(snapshot, 1);
+      return dayReply(snapshot, (pkNow().dayIndex + 1) % 7);
     case 'done':
       return markDone(snapshot, state?.deadlines ?? {}, raw).message;
     case 'login': case 'relogin':
@@ -197,6 +290,9 @@ export async function handleCommand(text, { snapshot, state, refresh } = {}) {
       if (!refresh) return 'Refresh is not available here.';
       return await refresh();
     default:
+      // A weekday name gives that day's classes, deadlines and announcements.
+      if (Object.hasOwn(DAY_ALIASES, cmd)) return dayReply(snapshot, DAY_ALIASES[cmd]);
+
       // Not a command. The bot lives in a personal chat that also gets used
       // as a notepad - forwarded files, links, notes to self - so anything
       // unrecognised is ignored rather than answered with a help dump.
