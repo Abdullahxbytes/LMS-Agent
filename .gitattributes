@@ -1,0 +1,11 @@
+# A shell script checked out with CRLF fails on Linux with a confusing
+# "bad interpreter: /usr/bin/env bash^M", so shell scripts are pinned to LF
+# regardless of the platform they are cloned onto.
+*.sh text eol=lf
+
+# PowerShell is happier with native Windows endings.
+*.ps1 text eol=crlf
+
+# Let git normalise everything else, and never touch the lockfile.
+* text=auto
+package-lock.json -text

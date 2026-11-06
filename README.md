@@ -13,10 +13,25 @@ Three things deliberately do **not** travel through git: `.env` (credentials),
 `auth_info/` (the WhatsApp pairing) and `out/` (scraped academic data).
 
 ```sh
-git clone <repo-url> lms-agent
-cd lms-agent
-npm install
-cp .env.example .env     # then fill in CUST_EMAIL and CUST_PASSWORD
+git clone https://github.com/Abdullahxbytes/LMS-Agent.git
+cd LMS-Agent
+
+powershell -ExecutionPolicy Bypass -File setup.ps1   # Windows
+bash setup.sh                                        # Linux / macOS
+```
+
+The setup script installs the npm packages at their locked versions, makes
+sure there is a browser for the Microsoft login (it drives an installed Edge
+where there is one, and downloads Chromium where there is not), and creates
+`.env` from the template. It will not overwrite an existing `.env`, and it
+reports which values are still blank without printing any of them.
+
+It does **not** install Node - that has to be Node 22 or newer, from
+<https://nodejs.org>, because every script here uses `--env-file`.
+
+Then fill in `CUST_EMAIL` and `CUST_PASSWORD` in `.env`, and:
+
+```sh
 npm run login            # verifies the Microsoft login works
 npm run scrape           # first snapshot; nothing is diffed against it
 npm run pair             # scan the QR with WhatsApp
