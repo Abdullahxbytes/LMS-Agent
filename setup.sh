@@ -99,7 +99,10 @@ else
   warn 'Could not install the system libraries automatically.'
   warn 'This is usually fine on a Mint desktop. If "npm run login" later'
   warn 'fails with a missing .so file, run this yourself:'
-  warn '    sudo npx playwright-core install-deps chromium'
+  # PATH is passed through on purpose: a Node installed by nvm lives under the
+  # user's home directory, and sudo replaces PATH with a fixed system one, so
+  # a plain "sudo npx" fails with "npx: command not found".
+  warn '    sudo env "PATH=$PATH" npx playwright-core install-deps chromium'
 fi
 
 # --- .env ------------------------------------------------------------------

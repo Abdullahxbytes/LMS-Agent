@@ -9,6 +9,9 @@ server-rendered with QWeb.
 
 ## Setting up on a new machine
 
+**[SETUP.md](SETUP.md) is the step-by-step walkthrough**, written for Linux
+Mint. What follows is the short version.
+
 Three things deliberately do **not** travel through git: `.env` (credentials),
 `auth_info/` (the WhatsApp pairing) and `out/` (scraped academic data).
 
@@ -26,8 +29,15 @@ powershell -ExecutionPolicy Bypass -File setup.ps1   # Windows
 
 ```sh
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-exec $SHELL
+```
+
+Then, as a separate paste (not `exec $SHELL`, which discards anything pasted
+after it):
+
+```sh
+source ~/.bashrc
 nvm install 22
+nvm alias default 22
 ```
 
 While downloading Chromium, Playwright prints *"your OS is not officially
