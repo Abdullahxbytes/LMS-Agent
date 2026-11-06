@@ -1,0 +1,205 @@
+// Inbound chat commands. Everything answers from the stored snapshot rather
+// than hitting the portal, so replies are instant and work even when the
+// portal is down.
+
+import { refreshSession } from './login.mjs';
+import { collectDeadlines, markDone } from './deadlines.mjs';
+import { unpaid } from './invoices.mjs';
+import { slotsForDay } from './timetable.mjs';
+import { pkNow } from './attendance.mjs';
+import { setSession, looksLikeSession } from './session.mjs';
+import { checkSession } from './portal.mjs';
+import { abbreviate, headingLines, shortLabel, findCourses } from './courses.mjs';
+
+const fmt = (d) => new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Karachi', weekday: 'short', day: '2-digit',
+  month: 'short', hour: '2-digit', minute: '2-digit', hour12: true,
+}).format(d);
+
+const money = (n) => `Rs ${n.toLocaleString('en-PK')}`;
+const LOW_ATTENDANCE = 75;
+
+function marksReply(snapshot, query) {
+  const courses = findCourses(snapshot, query).filter((c) => (c.marks ?? []).length);
+  if (!courses.length) return query ? `No marks found for "${query}".` : 'Nothing graded yet.';
+
+  const out = [];
+  for (const c of courses) {
+    const lines = [headingLines(c)];
+    for (const cat of c.marks) {
+      const head = `${cat.category}${cat.weight != null ? ` (${cat.weight}%)` : ''}`;
+      lines.push(cat.obtainedPercent != null ? `${head}: ${cat.obtainedPercent}%` : `${head}: -`);
+      for (const i of cat.items) {
+        const vs = i.classAverage != null
+          ? `  avg ${i.classAverage} ${i.obtained >= i.classAverage ? '(above)' : '(below)'}` : '';
+        lines.push(`   ${i.name}: ${i.obtained}/${i.maxMark}${vs}`);
+      }
+    }
+    out.push(lines.join('\n'));
+  }
+  return out.join('\n\n');
+}
+
+function attendanceReply(snapshot, query) {
+  const courses = findCourses(snapshot, query).filter((c) => c.attendance);
+  if (!courses.length) return 'No attendance data yet.';
+
+  // Two short lines per course rather than aligned columns. WhatsApp renders
+  // in a proportional font, so padded columns never line up anyway, and on a
+  // phone they wrap into something unreadable.
+  const blocks = courses
+    .sort((a, b) => a.attendance.percent - b.attendance.percent)
+    .map((c) => {
+      const a = c.attendance;
+      const warn = a.percent < LOW_ATTENDANCE ? '  <- BELOW 75%' : '';
+      return `*${shortLabel(c)}* - ${a.percent}%  (${a.attended}/${a.conducted})${warn}`
+        + NL + (c.name ?? '');
+    });
+
+  const low = courses.filter((c) => c.attendance.percent < LOW_ATTENDANCE);
+  const out = ['*Attendance*', '', blocks.join(NL + NL)];
+  if (low.length) out.push('', `Warning: ${low.length} course(s) below 75%.`);
+  return out.join(NL);
+}
+
+function dueReply(snapshot) {
+  const now = Date.now();
+  const items = collectDeadlines(snapshot).filter((i) => i.due.getTime() > now).slice(0, 10);
+  if (!items.length) return 'No upcoming submission or assessment deadlines.';
+  return items.map((i) => {
+    const hrs = (i.due - now) / 3600000;
+    const left = hrs < 48 ? `${hrs.toFixed(0)}h` : `${(hrs / 24).toFixed(0)}d`;
+    return `*${abbreviate(i.course) || i.code}* - ${i.name}` + NL + i.course + NL + `   ${fmt(i.due)}  (in ${left})`;
+  }).join('\n');
+}
+
+function examsReply(snapshot) {
+  const rows = (snapshot.global?.datesheet ?? []).flatMap((t) => t.rows ?? []);
+  if (!rows.length) return 'No exam datesheet published.';
+
+  const day = (iso) => {
+    const d = new Date(`${iso}T00:00:00+05:00`);
+    if (Number.isNaN(d.getTime())) return iso;
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Karachi', weekday: 'short', day: '2-digit', month: 'short',
+    }).format(d);
+  };
+
+  const blocks = rows.map((r) => `*${abbreviate(r[1]) || r[1]}* - ${day(r[3])}`
+    + NL + `${r[4]}` + NL + `${r[1]}`);
+  return ['*Exams*', '', blocks.join(NL + NL)].join(NL);
+}
+
+function feesReply(snapshot) {
+  const list = unpaid(snapshot);
+  if (!list.length) return 'No unpaid challans.';
+  return list.map((i) => `*${i.type}* ${i.term}\n${money(i.amount)} due ${i.dueDate}\nChallan ${i.id}`).join('\n\n');
+}
+
+function todayReply(snapshot, offsetDays = 0) {
+  const now = pkNow();
+  const dayIndex = (now.dayIndex + offsetDays + 7) % 7;
+  const slots = slotsForDay(snapshot.timetable ?? [], dayIndex);
+  if (!slots.length) return offsetDays ? 'No classes tomorrow.' : 'No classes today.';
+  const label = slots[0].day;
+  return [`*${label}*`, ...slots.map((s) => `${s.start}-${s.end}  ${shortLabel(s)} (${s.kind})`)].join(NL);
+}
+
+const NL = String.fromCharCode(10);
+
+const HELP = [
+  '*Commands*',
+  '',
+  '*marks* [course] - with class averages',
+  '*attendance* [course] - % per course',
+  '*due* - upcoming deadlines',
+  '*today* / *tomorrow* - classes',
+  '*exams* - datesheet',
+  '*fees* - unpaid challans',
+  '*done* [item] - stop reminders',
+  '*login* - refresh the portal session',
+  '*cookie* <value> - set the session id',
+  '*refresh* - re-scrape now',
+  '',
+  'A course can be a short form, a name or a code:',
+  'marks PDC  /  attendance ai  /  marks CS3432',
+].join(String.fromCharCode(10));
+
+
+// Lets the session be replaced from the phone instead of editing .env and
+// restarting. The candidate is verified against the portal before it is
+// stored, so a bad paste cannot silently break every later poll.
+async function cookieReply(arg, refresh) {
+  const value = (arg || '').trim().replace(/^session_id=/, '');
+
+  if (!value) {
+    return ['Send: cookie <session_id>',
+            '',
+            'Open the portal in a browser while logged in, then:',
+            'F12 -> Storage (Firefox) or Application (Chrome)',
+            '-> Cookies -> odoo.cust.edu.pk -> session_id',
+            'Copy the Value and send it here.'].join('\n');
+  }
+  if (!looksLikeSession(value)) {
+    return `That is not a session id - expected 40 hex characters, got ${value.length}.`;
+  }
+  if (!(await checkSession(value))) {
+    return 'The portal rejected that cookie. Copy a fresh one while logged in.';
+  }
+
+  setSession(value);
+  const ok = 'Session updated and verified.';
+  return refresh ? `${ok}\n\n${await refresh()}` : ok;
+}
+
+// Triggers the browser login on demand. Useful when the portal has logged the
+// session out but the scraper has not noticed yet.
+async function loginReply(refresh) {
+  try {
+    await refreshSession({ log: () => {} });
+  } catch (e) {
+    return 'Login failed: ' + e.message;
+  }
+  const ok = 'Logged in with Microsoft; session refreshed.';
+  return refresh ? ok + NL + NL + (await refresh()) : ok;
+}
+
+export async function handleCommand(text, { snapshot, state, refresh } = {}) {
+  const raw = (text ?? '').trim();
+  const [word, ...rest] = raw.split(/\s+/);
+  const cmd = (word ?? '').toLowerCase();
+  const arg = rest.join(' ');
+
+  switch (cmd) {
+    case 'help': case 'commands': case '?':
+      return HELP;
+    case 'marks': case 'grade': case 'grades': case 'gradebook':
+      return marksReply(snapshot, arg);
+    case 'attendance': case 'att':
+      return attendanceReply(snapshot, arg);
+    case 'due': case 'deadline': case 'deadlines': case 'submissions':
+      return dueReply(snapshot);
+    case 'exam': case 'exams': case 'datesheet':
+      return examsReply(snapshot);
+    case 'fee': case 'fees': case 'invoice': case 'invoices': case 'challan':
+      return feesReply(snapshot);
+    case 'today':
+      return todayReply(snapshot, 0);
+    case 'tomorrow':
+      return todayReply(snapshot, 1);
+    case 'done':
+      return markDone(snapshot, state?.deadlines ?? {}, raw).message;
+    case 'login': case 'relogin':
+      return await loginReply(refresh);
+    case 'cookie': case 'session':
+      return await cookieReply(arg, refresh);
+    case 'refresh': case 'sync':
+      if (!refresh) return 'Refresh is not available here.';
+      return await refresh();
+    default:
+      // Not a command. The bot lives in a personal chat that also gets used
+      // as a notepad - forwarded files, links, notes to self - so anything
+      // unrecognised is ignored rather than answered with a help dump.
+      return null;
+  }
+}

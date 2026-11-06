@@ -1,0 +1,12 @@
+# Scraped portal pages contain personal academic data
+out/
+
+# Credentials
+.env
+.env.*
+
+# WhatsApp (Baileys) session state
+auth_info*/
+
+node_modules/
+!.env.example
