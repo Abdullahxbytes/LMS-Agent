@@ -48,6 +48,31 @@ const TICK_MINUTES = Number(process.env.TICK_MINUTES ?? 5);
 const SCRAPE_EVERY_MINUTES = Number(process.env.SCRAPE_EVERY_MINUTES ?? 45);
 const INVOICE_HOUR = 9;
 
+// The periodic scrape only runs during waking hours. Nothing is posted to the
+// portal at 4am, so polling it then is pure load for no news - this cuts the
+// daily request count by about a third. Pakistan time, and the window wraps
+// past midnight.
+//
+// This bounds only the scheduled scrape. Attendance checks around a class, the
+// deadline reminders and anything typed in chat are unaffected.
+const ACTIVE_FROM = process.env.ACTIVE_FROM ?? '07:00';
+const ACTIVE_UNTIL = process.env.ACTIVE_UNTIL ?? '00:30';
+
+const hhmm = (value) => {
+  const [h, m] = String(value).split(':').map(Number);
+  return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+};
+
+export function withinActiveHours(now) {
+  const from = hhmm(ACTIVE_FROM);
+  const until = hhmm(ACTIVE_UNTIL);
+  // A window ending after midnight (07:00 -> 00:30) is the normal case here,
+  // so "inside" means either side of the wrap rather than between the two.
+  return from <= until
+    ? now.minutes >= from && now.minutes < until
+    : now.minutes >= from || now.minutes < until;
+}
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const readJson = (p, fallback) => (existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : fallback);
 
@@ -103,7 +128,10 @@ function runScrape() {
   });
 }
 
-async function fullSync({ announce = true } = {}) {
+// touchCycle=false scrapes without restarting the periodic clock. A refresh
+// asked for from chat should hand back fresh data without silently pushing the
+// next scheduled scrape 45 minutes into the future.
+async function fullSync({ announce = true, touchCycle = true } = {}) {
   log('scraping...');
   const result = await runScrape();
 
@@ -134,7 +162,7 @@ async function fullSync({ announce = true } = {}) {
 
   const previous = snapshot;
   snapshot = readJson(SNAP, snapshot);
-  state.lastScrapeAt = Date.now();
+  if (touchCycle) state.lastScrapeAt = Date.now();
 
   if (announce && (previous.courses ?? []).length) {
     const events = [...diffSnapshots(previous, snapshot), ...diffInvoices(previous, snapshot)];
@@ -183,7 +211,11 @@ async function invoiceTick() {
 
 async function tick() {
   try {
-    if (Date.now() - (state.lastScrapeAt ?? 0) > SCRAPE_EVERY_MINUTES * 60000) await fullSync();
+    const due = Date.now() - (state.lastScrapeAt ?? 0) > SCRAPE_EVERY_MINUTES * 60000;
+    // The quiet window must not leave a fresh install with nothing to answer
+    // from: with no snapshot yet, scrape whatever the hour.
+    const haveData = (snapshot.courses ?? []).length > 0;
+    if (due && (withinActiveHours(pkNow()) || !haveData)) await fullSync();
     await attendanceTick();
     await deadlineTick();
     await invoiceTick();
@@ -242,14 +274,17 @@ const wa = await connectWhatsApp({
   },
   onMessage: (text) => handleCommand(text, {
     snapshot, state,
+    // A refresh from chat always scrapes, even outside active hours, and
+    // leaves the periodic clock where it was.
     refresh: async () => {
-      const msg = await fullSync({ announce: true });
+      const msg = await fullSync({ announce: true, touchCycle: false });
       await flushOutbox();
       return msg;
     },
   }),
 });
 
-log(`tick every ${TICK_MINUTES}m, full scrape every ${SCRAPE_EVERY_MINUTES}m`);
+log(`tick every ${TICK_MINUTES}m, full scrape every ${SCRAPE_EVERY_MINUTES}m`
+  + ` between ${ACTIVE_FROM} and ${ACTIVE_UNTIL} PKT`);
 setInterval(tick, TICK_MINUTES * 60000);
 tick();

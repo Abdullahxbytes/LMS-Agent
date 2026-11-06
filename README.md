@@ -240,10 +240,32 @@ npm run dev      # local: reads .env
 npm start        # deployed: reads real environment variables
 ```
 
+### Polling schedule
+
+Three independent timers. The 5-minute tick is a clock check only - it makes
+no network request unless one of the others is due.
+
+| What | When | Cost per run |
+| --- | --- | --- |
+| Full scrape | every 45 min, **07:00-00:30 PKT only** | ~65 requests |
+| Attendance | +20 min and +80 min after a class starts | 1 request |
+| Deadline / fee reminders | from the stored snapshot | none |
+
+Nothing is published to the portal overnight, so the scheduled scrape pauses
+between 00:30 and 07:00 - about 28% fewer requests per day for no lost
+coverage. Set `ACTIVE_FROM` / `ACTIVE_UNTIL` to change it. The window is
+ignored when there is no snapshot yet, so a fresh install still gets data
+whatever the hour.
+
+`refresh` (or `sync`) from chat scrapes immediately, works outside the active
+window, and deliberately **does not** restart the 45-minute clock - asking for
+fresh data should not quietly delay the next scheduled check.
+
 ### Pairing
 
-Baileys is pinned to **6.7.24**, the stable line. npm's `latest` tag points
-at `7.0.0-rc14`, a release candidate whose pairing is unreliable.
+Baileys is on **7.0.0-rc14**. The 6.x line addressed this account by phone
+number, which left the primary phone unable to decrypt the bot's replies once
+WhatsApp migrated it to LID addressing.
 
 Pair with the dedicated tool, not the bot - it keeps pairing problems
 separate from portal logs:
