@@ -16,9 +16,24 @@ Three things deliberately do **not** travel through git: `.env` (credentials),
 git clone https://github.com/Abdullahxbytes/LMS-Agent.git
 cd LMS-Agent
 
-powershell -ExecutionPolicy Bypass -File setup.ps1   # Windows
 bash setup.sh                                        # Linux / macOS
+powershell -ExecutionPolicy Bypass -File setup.ps1   # Windows
 ```
+
+**On Linux Mint, install Node first.** Mint's apt package is far too old
+(Mint 21 ships Node 12, Mint 22 ships Node 18; this needs 22+), so
+`apt install nodejs` will not do. Use nvm, which needs no root:
+
+```sh
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+exec $SHELL
+nvm install 22
+```
+
+While downloading Chromium, Playwright prints *"your OS is not officially
+supported ... downloading fallback build"*. That is expected on Mint and is
+not an error - Playwright maps Mint onto the matching Ubuntu build (Mint 21
+to ubuntu22.04, Mint 22+ to ubuntu24.04).
 
 The setup script installs the npm packages at their locked versions, makes
 sure there is a browser for the Microsoft login (it drives an installed Edge
