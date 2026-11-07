@@ -151,20 +151,13 @@ function dayReply(snapshot, dayIndex, mode = 'exact') {
   const when = ahead === 0 ? 'today' : ahead === 1 ? 'tomorrow' : `in ${ahead} days`;
   const out = [`*${prettyPk(iso)}*  (${when})`];
 
+  // Everything is gathered before anything is printed. Silence about a day is
+  // ambiguous - it reads the same as the bot having no data - so an empty day
+  // says so explicitly, and a day with classes but nothing due says that on
+  // one line directly under the timetable.
   const slots = slotsForDay(snapshot.timetable ?? [], dayIndex);
-  if (slots.length) {
-    out.push('', '*Classes*');
-    for (const s of slots) out.push(`${s.start}-${s.end}  ${shortLabel(s)} (${s.kind})`);
-  }
 
   const due = collectDeadlines(snapshot).filter((i) => isoPk(i.due) === iso);
-  if (due.length) {
-    out.push('', '*Due*');
-    for (const i of due) {
-      out.push(`*${abbreviate(i.course) || i.code}* - ${i.name}`);
-      out.push(timePk(i.due));
-    }
-  }
 
   const exams = (snapshot.global?.datesheet ?? []).flatMap((t) => {
     const iDate = colIdx(t.columns, 'date');
@@ -175,11 +168,6 @@ function dayReply(snapshot, dayIndex, mode = 'exact') {
       .filter((r) => String(r[iDate] ?? '').trim() === iso)
       .map((r) => ({ name: iClass >= 0 ? r[iClass] : '', time: iTime >= 0 ? r[iTime] : '' }));
   });
-  if (exams.length) {
-    out.push('', '*Exams*');
-    for (const e of exams) out.push(`*${abbreviate(e.name) || e.name}* - ${e.time}`);
-  }
-
   const notes = [];
   for (const c of snapshot.courses ?? []) {
     for (const t of c.tabs?.info ?? []) {
@@ -197,6 +185,33 @@ function dayReply(snapshot, dayIndex, mode = 'exact') {
       }
     }
   }
+  if (!slots.length && !due.length && !exams.length && !notes.length) {
+    out.push('', 'Nothing scheduled.');
+    return out.join(NL);
+  }
+
+  if (slots.length) {
+    out.push('', '*Classes*');
+    for (const s of slots) out.push(`${s.start}-${s.end}  ${shortLabel(s)} (${s.kind})`);
+  }
+
+  // Sits right under the timetable, where the Due and Exams headings would
+  // have been, so the absence is as plain as a listing would be.
+  if (!due.length && !exams.length) out.push('', 'Nothing due, no exams.');
+
+  if (due.length) {
+    out.push('', '*Due*');
+    for (const i of due) {
+      out.push(`*${abbreviate(i.course) || i.code}* - ${i.name}`);
+      out.push(timePk(i.due));
+    }
+  }
+
+  if (exams.length) {
+    out.push('', '*Exams*');
+    for (const e of exams) out.push(`*${abbreviate(e.name) || e.name}* - ${e.time}`);
+  }
+
   if (notes.length) {
     out.push('', '*Announcements*');
     for (const n of notes) {
@@ -205,8 +220,6 @@ function dayReply(snapshot, dayIndex, mode = 'exact') {
     }
   }
 
-  // Only the heading means the day is empty.
-  if (out.length === 1) out.push('', 'Nothing scheduled.');
   return out.join(NL);
 }
 
@@ -219,7 +232,7 @@ const HELP = [
   '*attendance* [course] - % per course',
   '*due* - upcoming deadlines',
   '*today* / *tomorrow* - the day ahead',
-  '*monday* ... *sunday* - any weekday',
+  '*monday* ... *sunday* - any coming weekday',
   '*exams* - datesheet',
   '*fees* - unpaid challans',
   '*done* [item] - stop reminders',
