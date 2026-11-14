@@ -2,7 +2,7 @@
 // Snapshots are what the notifier diffs and what the chat bot queries.
 // Run: node --env-file=.env scrape.mjs
 
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import * as cheerio from 'cheerio';
 import { parseTimetable } from './timetable.mjs';
 import { getSession } from './session.mjs';
@@ -22,8 +22,15 @@ const GLOBAL_PAGES = {
 
 class SessionExpired extends Error {}
 
+// Without a limit, Node waits up to five minutes for a page that never
+// arrives, and a hung portal kept a scrape alive long enough for the next
+// one to start on top of it. Pages are ~1 MB, so this is generous; a tab
+// that times out is recorded as an error, which the diff treats as no change.
+const REQUEST_TIMEOUT_MS = 180_000;
+
 async function get(path) {
   const res = await fetch(BASE + path, {
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     redirect: 'manual',
     headers: { Cookie: `session_id=${SID}`, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
   });
@@ -211,5 +218,8 @@ try {
 }
 
 mkdirSync('out', { recursive: true });
-writeFileSync('out/snapshot.json', JSON.stringify(snapshot, null, 2));
+// Written beside the real file and renamed over it, so the bot never reads a
+// half-written snapshot. A rename within one directory is atomic.
+writeFileSync('out/snapshot.json.tmp', JSON.stringify(snapshot, null, 2));
+renameSync('out/snapshot.json.tmp', 'out/snapshot.json');
 console.log(`\nSaved out/snapshot.json`);

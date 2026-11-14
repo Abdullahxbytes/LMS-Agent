@@ -192,7 +192,25 @@ export async function fetchSessionViaLogin({ headless = true, log = console.log 
 
 // Logs in and stores the cookie, returning it. Used by the bot when a scrape
 // reports an expired session.
-export async function refreshSession({ log = console.log } = {}) {
+//
+// Only one login runs at a time. Overlapping scrapes, a mid-tick expiry and
+// the `login` chat command can all ask at once; each starting its own browser
+// meant a wrong password was tried several times back to back, which is
+// exactly what risks locking the Microsoft account. Callers arriving while a
+// login is in flight share its outcome, success or failure.
+let loginInFlight = null;
+
+export function refreshSession({ log = console.log } = {}) {
+  if (!loginInFlight) {
+    loginInFlight = doRefreshSession({ log })
+      .finally(() => { loginInFlight = null; });
+  } else {
+    log('login already in progress - waiting for it');
+  }
+  return loginInFlight;
+}
+
+async function doRefreshSession({ log }) {
   const value = await fetchSessionViaLogin({ log });
   if (!(await checkSession(value))) {
     throw new LoginFailed('Got a cookie, but the portal would not accept it');

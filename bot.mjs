@@ -14,6 +14,7 @@ import { diffInvoices, invoiceReminders } from './invoices.mjs';
 import { deadlineReminders } from './deadlines.mjs';
 import { runAttendancePass, pkNow, dueChecks } from './attendance.mjs';
 import { attendanceRows, SessionExpired } from './portal.mjs';
+import { briefingText } from './briefing.mjs';
 
 const SNAP = 'out/snapshot.json';
 const LOCK = 'out/bot.lock';
@@ -58,6 +59,12 @@ const INVOICE_HOUR = 9;
 const ACTIVE_FROM = process.env.ACTIVE_FROM ?? '07:00';
 const ACTIVE_UNTIL = process.env.ACTIVE_UNTIL ?? '00:30';
 
+// Morning briefing, Pakistan time. "off" disables it. It goes out on the
+// first tick after this time, which falls after the 07:00 scrape, and not at
+// all if the bot only comes up hours later - a briefing at 2pm is just noise.
+const BRIEFING_AT = process.env.BRIEFING_AT ?? '07:30';
+const BRIEFING_LATEST_HOURS = 4;
+
 const hhmm = (value) => {
   const [h, m] = String(value).split(':').map(Number);
   return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
@@ -79,10 +86,12 @@ const readJson = (p, fallback) => (existsSync(p) ? JSON.parse(readFileSync(p, 'u
 mkdirSync('out', { recursive: true });
 
 let state = readJson(STATE, { attendance: {}, deadlines: {}, invoiceDays: {}, lastScrapeAt: 0 });
+state.briefingDays ??= {};
 let snapshot = readJson(SNAP, { courses: [], global: {}, timetable: [] });
 const saveState = () => writeFileSync(STATE, JSON.stringify(state, null, 2));
 
 let send = async (t) => log('[not connected]', t);
+let sendDocument = async () => { throw new Error('WhatsApp not connected yet'); };
 let connected = false;
 const NL = String.fromCharCode(10);
 const OUTBOX = 'out/outbox.json';
@@ -94,7 +103,20 @@ const outbox = readJson(OUTBOX, []);
 const saveOutbox = () => writeFileSync(OUTBOX, JSON.stringify(outbox, null, 2));
 const notify = async (text) => { outbox.push(text); saveOutbox(); };
 
-async function flushOutbox() {
+// One drain at a time. The tick, a chat refresh and onReady can all flush at
+// once, and two loops both sending outbox[0] and then both shifting would
+// deliver one message twice and drop the next one unsent. A caller arriving
+// mid-drain just waits for it: the loop reads the live queue, so anything
+// queued meanwhile goes out in the same drain.
+let flushInFlight = null;
+function flushOutbox() {
+  if (!flushInFlight) {
+    flushInFlight = drainOutbox().finally(() => { flushInFlight = null; });
+  }
+  return flushInFlight;
+}
+
+async function drainOutbox() {
   // The first tick runs before WhatsApp finishes connecting. Draining into
   // the placeholder sender would log each message and drop it; leave them
   // queued and onReady will flush as soon as the socket is up.
@@ -131,7 +153,30 @@ function runScrape() {
 // touchCycle=false scrapes without restarting the periodic clock. A refresh
 // asked for from chat should hand back fresh data without silently pushing the
 // next scheduled scrape 45 minutes into the future.
+//
+// Only one scrape runs at a time. Two overlapping ones both diffed against the
+// same previous snapshot and announced every change twice; a hung portal let
+// them pile up one per tick. A request arriving mid-scrape joins it and gets
+// its result. The clock is reset only by a caller that asked for it and only
+// when the scrape succeeded, so a chat refresh joined by the scheduled cycle
+// still counts as that cycle's scrape.
+let syncInFlight = null;
+
 async function fullSync({ announce = true, touchCycle = true } = {}) {
+  if (syncInFlight) {
+    log('scrape already running - joining it');
+  } else {
+    syncInFlight = doFullSync({ announce }).finally(() => { syncInFlight = null; });
+  }
+  const { ok, message } = await syncInFlight;
+  if (ok && touchCycle) {
+    state.lastScrapeAt = Date.now();
+    saveState();
+  }
+  return message;
+}
+
+async function doFullSync({ announce }) {
   log('scraping...');
   const result = await runScrape();
 
@@ -144,36 +189,35 @@ async function fullSync({ announce = true, touchCycle = true } = {}) {
     } catch (e) {
       await notify('*Session expired and automatic login failed.*' + NL + e.message
         + NL + NL + 'Send: cookie <value>   with a fresh session id to carry on.');
-      return 'Session expired; automatic login failed: ' + e.message;
+      return { ok: false, message: 'Session expired; automatic login failed: ' + e.message };
     }
 
     const retry = await runScrape();
     if (!retry.ok) {
       await notify('*Logged in again, but the scrape still failed.*');
-      return 'Logged in, but the scrape failed.';
+      return { ok: false, message: 'Logged in, but the scrape failed.' };
     }
     log('recovered with a fresh session');
     result.ok = true;
   }
   if (!result.ok) {
     log('scrape failed:', result.err.slice(0, 300));
-    return 'Scrape failed.';
+    return { ok: false, message: 'Scrape failed.' };
   }
 
   const previous = snapshot;
   snapshot = readJson(SNAP, snapshot);
-  if (touchCycle) state.lastScrapeAt = Date.now();
 
   if (announce && (previous.courses ?? []).length) {
     const events = [...diffSnapshots(previous, snapshot), ...diffInvoices(previous, snapshot)];
     for (const e of events) await notify(e.text);
     log(`diff produced ${events.length} event(s)`);
     saveState();
-    return `Synced. ${events.length} change(s).`;
+    return { ok: true, message: `Synced. ${events.length} change(s).` };
   }
 
   saveState();
-  return 'Synced.';
+  return { ok: true, message: 'Synced.' };
 }
 
 async function attendanceTick() {
@@ -209,7 +253,50 @@ async function invoiceTick() {
   for (const r of invoiceReminders(snapshot, now.date)) await notify(r.text);
 }
 
+async function briefingTick() {
+  if (/^off$/i.test(BRIEFING_AT)) return;
+  const now = pkNow();
+  const from = hhmm(BRIEFING_AT);
+  if (state.briefingDays[now.date]) return;
+  if (now.minutes < from || now.minutes > from + BRIEFING_LATEST_HOURS * 60) return;
+  if (!(snapshot.courses ?? []).length) return;
+
+  // Recorded as decided even on an empty day, so the check is not repeated
+  // every tick until noon.
+  state.briefingDays[now.date] = true;
+  // Only the last two weeks are kept; the file would otherwise grow forever.
+  for (const day of Object.keys(state.briefingDays)) {
+    if (Date.parse(now.date) - Date.parse(day) > 14 * 864e5) delete state.briefingDays[day];
+  }
+
+  const text = briefingText(snapshot, { now, doneState: state.deadlines });
+  if (text) {
+    await notify(text);
+    log('morning briefing queued');
+  } else {
+    log('morning briefing: nothing to report today');
+  }
+}
+
+// setInterval does not wait for an async callback. A tick still busy with a
+// slow scrape or a login would otherwise be joined by the next one, and two
+// attendance passes reading the same state could both report one absence.
+let ticking = false;
+
 async function tick() {
+  if (ticking) {
+    log('previous tick still running - skipping this one');
+    return;
+  }
+  ticking = true;
+  try {
+    await tickOnce();
+  } finally {
+    ticking = false;
+  }
+}
+
+async function tickOnce() {
   try {
     const due = Date.now() - (state.lastScrapeAt ?? 0) > SCRAPE_EVERY_MINUTES * 60000;
     // The quiet window must not leave a fresh install with nothing to answer
@@ -219,6 +306,7 @@ async function tick() {
     await attendanceTick();
     await deadlineTick();
     await invoiceTick();
+    await briefingTick();
     saveState();
     await flushOutbox();
   } catch (e) {
@@ -266,14 +354,18 @@ const wa = await connectWhatsApp({
   // creds.me and makes an already-paired device look unpaired.
   pairNumber: null,
   log,
-  onReady: ({ send: s }) => {
+  onReady: ({ send: s, sendDocument: d }) => {
     send = s;
+    sendDocument = d;
     connected = true;
     notify('CUST portal agent is online. Send "help" for commands.');
     flushOutbox();
   },
   onMessage: (text) => handleCommand(text, {
     snapshot, state,
+    // Files go straight out rather than through the outbox: they are a reply
+    // to a request made just now, and the outbox persists text only.
+    sendFile: (file) => sendDocument(file),
     // A refresh from chat always scrapes, even outside active hours, and
     // leaves the periodic clock where it was.
     refresh: async () => {

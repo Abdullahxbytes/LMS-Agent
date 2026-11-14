@@ -1,0 +1,12 @@
+{
+    "schema_version": 2,
+    "commit": "ca091956aa15657bfba65d60db0eff4b588345b6",
+    "indexed_at": "2026-11-14T17:23:26Z",
+    "project": "C-Users-INDUS-Desktop-projects-hermes",
+    "nodes": 392,
+    "edges": 1057,
+    "original_size": 3604480,
+    "compressed_size": 544674,
+    "compression_level": 3,
+    "reconcile_basis": "git-clean-head"
+}

@@ -1,15 +1,21 @@
 // Inbound chat commands. Everything answers from the stored snapshot rather
 // than hitting the portal, so replies are instant and work even when the
-// portal is down.
+// portal is down. The exceptions are login/cookie/refresh, and get, which
+// fetches the file asked for.
 
 import { refreshSession } from './login.mjs';
 import { collectDeadlines, markDone } from './deadlines.mjs';
 import { unpaid } from './invoices.mjs';
-import { slotsForDay } from './timetable.mjs';
 import { pkNow } from './attendance.mjs';
 import { setSession, looksLikeSession } from './session.mjs';
-import { checkSession } from './portal.mjs';
+import { checkSession, SessionExpired } from './portal.mjs';
 import { abbreviate, headingLines, shortLabel, findCourses } from './courses.mjs';
+import { DAY_ALIASES, dayReply } from './day.mjs';
+import {
+  MIN_ATTENDANCE, attendanceBudget, budgetText, standing, parseResults, nextClass, minutesLabel,
+} from './insights.mjs';
+import { materialsOf, searchMaterials, liveMaterials, downloadMaterial } from './materials.mjs';
+import { briefingText } from './briefing.mjs';
 
 const fmt = (d) => new Intl.DateTimeFormat('en-GB', {
   timeZone: 'Asia/Karachi', weekday: 'short', day: '2-digit',
@@ -96,132 +102,6 @@ function feesReply(snapshot) {
   return list.map((i) => `*${i.type}* ${i.term}\n${money(i.amount)} due ${i.dueDate}\nChallan ${i.id}`).join('\n\n');
 }
 
-const DAY_ALIASES = {
-  sun: 0, sunday: 0,
-  mon: 1, monday: 1,
-  tue: 2, tues: 2, tuesday: 2,
-  wed: 3, weds: 3, wednesday: 3,
-  thu: 4, thur: 4, thurs: 4, thursday: 4,
-  fri: 5, friday: 5,
-  sat: 6, saturday: 6,
-};
-
-// All three formatters are pinned to Pakistan time so the answer is the same
-// whatever the host clock is set to.
-const isoPk = (d) => new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
-}).format(d);
-
-const timePk = (d) => new Intl.DateTimeFormat('en-GB', {
-  timeZone: 'Asia/Karachi', hour: '2-digit', minute: '2-digit', hour12: true,
-}).format(d);
-
-const prettyPk = (iso) => new Intl.DateTimeFormat('en-GB', {
-  timeZone: 'Asia/Karachi', weekday: 'long', day: '2-digit', month: 'short',
-}).format(new Date(`${iso}T00:00:00+05:00`));
-
-const colIdx = (columns, name) =>
-  (columns ?? []).findIndex((c) => String(c).trim().toLowerCase() === name);
-
-// How many days ahead a request lands.
-//
-// 'exact' is the literal next occurrence, counting today as itself - what
-// `today` and `tomorrow` need.
-//
-// 'upcoming' is what a weekday NAME means. Today and tomorrow already have
-// their own commands, so naming either one's weekday is a request for the one
-// a week out: on a Monday, "monday" is next Monday and "tuesday" is next
-// week's Tuesday. From the day after tomorrow onwards it is simply this
-// week's - on a Monday, "wednesday" is two days away.
-export function dayOffset(dayIndex, todayIndex, mode = 'exact') {
-  const ahead = (dayIndex - todayIndex + 7) % 7;
-  return mode === 'upcoming' && ahead <= 1 ? ahead + 7 : ahead;
-}
-
-function dateForDay(dayIndex, mode = 'exact', now = pkNow()) {
-  const ahead = dayOffset(dayIndex, now.dayIndex, mode);
-  const base = new Date(`${now.date}T00:00:00+05:00`);
-  return { iso: isoPk(new Date(base.getTime() + ahead * 864e5)), ahead };
-}
-
-// Everything happening on one date: classes first, then what is due, then
-// exams, then anything posted to the course noticeboards that day.
-function dayReply(snapshot, dayIndex, mode = 'exact') {
-  const { iso, ahead } = dateForDay(dayIndex, mode);
-  const when = ahead === 0 ? 'today' : ahead === 1 ? 'tomorrow' : `in ${ahead} days`;
-  const out = [`*${prettyPk(iso)}*  (${when})`];
-
-  // Everything is gathered before anything is printed. Silence about a day is
-  // ambiguous - it reads the same as the bot having no data - so an empty day
-  // says so explicitly, and a day with classes but nothing due says that on
-  // one line directly under the timetable.
-  const slots = slotsForDay(snapshot.timetable ?? [], dayIndex);
-
-  const due = collectDeadlines(snapshot).filter((i) => isoPk(i.due) === iso);
-
-  const exams = (snapshot.global?.datesheet ?? []).flatMap((t) => {
-    const iDate = colIdx(t.columns, 'date');
-    const iClass = colIdx(t.columns, 'class');
-    const iTime = colIdx(t.columns, 'time');
-    if (iDate < 0) return [];
-    return (t.rows ?? [])
-      .filter((r) => String(r[iDate] ?? '').trim() === iso)
-      .map((r) => ({ name: iClass >= 0 ? r[iClass] : '', time: iTime >= 0 ? r[iTime] : '' }));
-  });
-  const notes = [];
-  for (const c of snapshot.courses ?? []) {
-    for (const t of c.tabs?.info ?? []) {
-      const iDate = colIdx(t.columns, 'date');
-      if (iDate < 0) continue;
-      const iSubject = colIdx(t.columns, 'subject');
-      const iDesc = colIdx(t.columns, 'description');
-      for (const r of t.rows ?? []) {
-        if (String(r[iDate] ?? '').trim() !== iso) continue;
-        notes.push({
-          code: c.code, course: c.name,
-          subject: iSubject >= 0 ? r[iSubject] : '',
-          desc: iDesc >= 0 ? String(r[iDesc] ?? '').trim() : '',
-        });
-      }
-    }
-  }
-  if (!slots.length && !due.length && !exams.length && !notes.length) {
-    out.push('', 'Nothing scheduled.');
-    return out.join(NL);
-  }
-
-  if (slots.length) {
-    out.push('', '*Classes*');
-    for (const s of slots) out.push(`${s.start}-${s.end}  ${shortLabel(s)} (${s.kind})`);
-  }
-
-  // Sits right under the timetable, where the Due and Exams headings would
-  // have been, so the absence is as plain as a listing would be.
-  if (!due.length && !exams.length) out.push('', 'Nothing due, no exams.');
-
-  if (due.length) {
-    out.push('', '*Due*');
-    for (const i of due) {
-      out.push(`*${abbreviate(i.course) || i.code}* - ${i.name}`);
-      out.push(timePk(i.due));
-    }
-  }
-
-  if (exams.length) {
-    out.push('', '*Exams*');
-    for (const e of exams) out.push(`*${abbreviate(e.name) || e.name}* - ${e.time}`);
-  }
-
-  if (notes.length) {
-    out.push('', '*Announcements*');
-    for (const n of notes) {
-      out.push(`*${abbreviate(n.course) || n.code}* - ${n.subject}`);
-      if (n.desc) out.push(n.desc.length > 160 ? n.desc.slice(0, 157) + '...' : n.desc);
-    }
-  }
-
-  return out.join(NL);
-}
 
 const NL = String.fromCharCode(10);
 
@@ -235,6 +115,13 @@ const HELP = [
   '*monday* ... *sunday* - any coming weekday',
   '*exams* - datesheet',
   '*fees* - unpaid challans',
+  '*next* - the next class',
+  '*skip* [course] - classes you can still miss',
+  '*standing* [course] - weighted marks vs class',
+  '*gpa* [term] - SGPA / CGPA history',
+  '*materials* [course] - course files',
+  '*get* <course> <n> - receive a file',
+  '*briefing* - the morning briefing now',
   '*done* [item] - stop reminders',
   '*login* - refresh the portal session',
   '*cookie* <value> - set the session id',
@@ -243,6 +130,182 @@ const HELP = [
   'A course can be a short form, a name or a code:',
   'marks PDC  /  attendance ai  /  marks CS3432',
 ].join(String.fromCharCode(10));
+
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const fixed = (n, d = 1) => (Number.isFinite(n) ? n.toFixed(d).replace(/\.0+$/, '') : '-');
+const squash = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// An exact hit on code, short form or full name beats a partial one, so
+// "pdc" means PDC rather than PDC and PDC Lab when a single course is needed.
+function pickCourses(snapshot, query, { exactOnly = false } = {}) {
+  const q = squash(query);
+  if (!q) return [];
+  const all = snapshot?.courses ?? [];
+  const exact = all.filter((c) => [c.code, c.name, abbreviate(c.name)].some((v) => squash(v) === q));
+  if (exact.length || exactOnly) return exact;
+  return findCourses(snapshot, query);
+}
+
+function skipReply(snapshot, query) {
+  const rows = findCourses(snapshot, query)
+    .map((c) => ({ c, b: attendanceBudget(c, snapshot.timetable ?? []) }))
+    .filter(({ b }) => b)
+    .sort((x, y) => (x.b.below === y.b.below ? x.b.canMiss - y.b.canMiss : x.b.below ? -1 : 1));
+  if (!rows.length) return query ? `No attendance found for "${query}".` : 'No attendance data yet.';
+
+  const blocks = rows.map(({ c, b }) => `*${shortLabel(c)}* ${b.percent}%  (${b.attended}/${b.conducted})`
+    + NL + budgetText(b));
+  return [`*Attendance budget*  (minimum ${MIN_ATTENDANCE}%)`, '', blocks.join(NL + NL), '',
+    '_Counted as of now; every class you attend adds to it._'].join(NL);
+}
+
+function standingReply(snapshot, query) {
+  const rows = findCourses(snapshot, query)
+    .map((c) => ({ c, s: standing(c) }))
+    .filter(({ s }) => s);
+  if (!rows.length) return query ? `Nothing graded yet for "${query}".` : 'Nothing graded yet.';
+
+  // Several courses: one compact line each. One course: the breakdown.
+  if (rows.length > 1) {
+    const lines = rows.map(({ c, s }) => {
+      const vs = s.avgPct != null ? ` vs avg ${fixed(s.avgPct, 0)}% (${s.youPct >= s.avgPct ? '+' : ''}${fixed(s.youPct - s.avgPct, 0)})` : '';
+      return `*${shortLabel(c)}* ${fixed(s.youPct, 0)}%${vs}` + NL + `   ${fixed(s.graded, 0)}% of the course graded`;
+    });
+    return ['*Standing so far*', '', lines.join(NL), '', '_standing <course> for the breakdown_'].join(NL);
+  }
+
+  const { c, s } = rows[0];
+  const out = [headingLines(c), `Graded so far: ${fixed(s.graded, 0)}% of the course`, ''];
+  const avg = s.avgPts != null ? `  |  class avg ${fixed(s.avgPts)}/${fixed(s.graded, 0)} (${fixed(s.avgPct, 0)}%)` : '';
+  out.push(`*You: ${fixed(s.youPts)}/${fixed(s.graded, 0)} (${fixed(s.youPct, 0)}%)*${avg}`, '');
+  for (const p of s.parts) {
+    const pAvg = p.avgPct != null ? `, avg ${fixed(p.avgPct, 0)}%` : '';
+    out.push(`${p.category} (${fixed(p.weight, 0)}%): you ${fixed(p.youPct, 0)}%${pAvg}  [${p.count}]`);
+  }
+  return out.join(NL);
+}
+
+function gpaReply(snapshot, query) {
+  const terms = parseResults(snapshot);
+  if (!terms.length) return 'No results on record yet.';
+
+  const q = String(query ?? '').trim().toLowerCase();
+  if (q) {
+    const term = /^(last|latest|recent)$/.test(q)
+      ? terms[terms.length - 1]
+      : terms.find((t) => squash(t.term).includes(squash(q)));
+    if (!term) return `No term matching "${query}". Terms: ${terms.map((t) => t.term).join(', ')}`;
+    const lines = term.courses.map((c) => `${c.grade.padEnd(2)}  ${c.name} (${fixed(c.credits, 0)} CH)`);
+    return [`*${term.term}*`, `SGPA ${fixed(term.sgpa, 2)}  |  CGPA ${fixed(term.cgpa, 2)}`, '', ...lines].join(NL);
+  }
+
+  const last = terms[terms.length - 1];
+  const lines = terms.map((t) => `${t.term}: SGPA ${fixed(t.sgpa, 2)}, CGPA ${fixed(t.cgpa, 2)}`);
+  return [`*CGPA ${fixed(last.cgpa, 2)}*  (${fixed(last.cumulative, 0)} credit hours)`, '', ...lines, '',
+    '_gpa <term> or gpa last for the grades_'].join(NL);
+}
+
+function nextReply(snapshot) {
+  const now = pkNow();
+  const n = nextClass(snapshot.timetable ?? [], now);
+  if (!n) return 'No classes in the timetable.';
+
+  const { block: b } = n;
+  const day = n.ahead === 0 ? 'today' : n.ahead === 1 ? 'tomorrow' : DAY_NAMES[b.dayIndex];
+  const head = n.inProgress
+    ? `*Now* - ends ${b.end}`
+    : `*Next class* in ${minutesLabel(n.startsIn)}`;
+  const out = [head, `*${shortLabel(b)}* (${b.kind})  ${b.start}-${b.end} ${day}`];
+  if (b.title) out.push(b.title);
+  if (b.teacher) out.push(b.teacher);
+  if (n.later.length) {
+    out.push('', `Later ${day}: ` + n.later.map((l) => `${shortLabel(l)} ${l.start}`).join(', '));
+  }
+  return out.join(NL);
+}
+
+function materialsList(course) {
+  const files = materialsOf(course);
+  if (!files.length) return `${headingLines(course)}${NL}No files uploaded.`;
+  const label = shortLabel(course);
+  return [headingLines(course), '',
+    ...files.map((f) => `${f.sr}. ${f.name}`), '',
+    `_Send: get ${label} <number>_`].join(NL);
+}
+
+function materialsReply(snapshot, query) {
+  if (query) {
+    const courses = pickCourses(snapshot, query);
+    if (!courses.length) return `No course matching "${query}".`;
+    return courses.map(materialsList).join(NL + NL);
+  }
+  const lines = (snapshot.courses ?? [])
+    .map((c) => ({ c, files: materialsOf(c) }))
+    .filter(({ files }) => files.length)
+    .map(({ c, files }) => `*${shortLabel(c)}* - ${files.length} file${files.length === 1 ? '' : 's'}`
+      + NL + `   latest: ${files[files.length - 1].name}`);
+  if (!lines.length) return 'No course files uploaded.';
+  return ['*Course files*', '', lines.join(NL), '', '_materials <course> to list, get <course> <n> to receive_'].join(NL);
+}
+
+// A live portal call that logs in again once if the session has died.
+async function withSession(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (!(e instanceof SessionExpired)) throw e;
+    await refreshSession({ log: () => {} });
+    return fn();
+  }
+}
+
+// Sends a course file as a WhatsApp document.
+//   get pdc 3          the 3rd file of PDC, as numbered by "materials pdc"
+//   get amdahl         a file found by words in its name or description
+//   get pdc            the list of PDC's files
+// "get" is ordinary English, and this chat doubles as a notepad, so when
+// nothing at all matches, `get` stays silent like any other note would.
+async function fileReply(snapshot, arg, { sendFile, quiet }) {
+  const query = String(arg ?? '').trim();
+  if (!query) return quiet ? null : 'Send: get <course> <number>, e.g. get PDC 3. See: materials';
+
+  let target = null;
+  const numbered = /^(.*\S)\s+#?(\d+)$/.exec(query);
+  if (numbered) {
+    const courses = pickCourses(snapshot, numbered[1]);
+    if (courses.length > 1) {
+      return 'Which course?' + NL + courses.map((c) => `get ${shortLabel(c)} ${numbered[2]}`).join(NL);
+    }
+    if (courses.length === 1) target = { course: courses[0], sr: Number(numbered[2]) };
+  }
+
+  if (!target) {
+    const course = pickCourses(snapshot, query, { exactOnly: true });
+    if (course.length === 1) return materialsList(course[0]);
+
+    const hits = searchMaterials(snapshot, query);
+    if (!hits.length) return quiet ? null : `No course file matching "${query}". See: materials`;
+    if (hits.length > 1) {
+      const shown = hits.slice(0, 8).map((h) => `get ${shortLabel(h.course)} ${h.sr}  - ${h.name}`);
+      const more = hits.length > 8 ? [`...and ${hits.length - 8} more`] : [];
+      return [`${hits.length} files match:`, ...shown, ...more].join(NL);
+    }
+    target = { course: hits[0].course, sr: hits[0].sr, name: hits[0].name };
+  }
+
+  if (!sendFile) return 'Sending files is not available here.';
+
+  const live = await withSession(() => liveMaterials(target.course));
+  // By name when known, since numbering can shift if a file is removed.
+  const row = (target.name && live.find((r) => r.name === target.name))
+    ?? live.find((r) => r.sr === target.sr);
+  if (!row) return `${shortLabel(target.course)} has no file ${target.sr}. See: materials ${shortLabel(target.course)}`;
+
+  const file = await withSession(() => downloadMaterial(row.href, row.name));
+  await sendFile({ ...file, caption: `${shortLabel(target.course)} - ${row.name}` });
+  // The document is the reply.
+  return null;
+}
 
 
 // Lets the session be replaced from the phone instead of editing .env and
@@ -283,7 +346,7 @@ async function loginReply(refresh) {
   return refresh ? ok + NL + NL + (await refresh()) : ok;
 }
 
-export async function handleCommand(text, { snapshot, state, refresh } = {}) {
+export async function handleCommand(text, { snapshot, state, refresh, sendFile } = {}) {
   const raw = (text ?? '').trim();
   const [word, ...rest] = raw.split(/\s+/);
   const cmd = (word ?? '').toLowerCase();
@@ -306,6 +369,23 @@ export async function handleCommand(text, { snapshot, state, refresh } = {}) {
       return dayReply(snapshot, pkNow().dayIndex);
     case 'tomorrow':
       return dayReply(snapshot, (pkNow().dayIndex + 1) % 7);
+    case 'next': case 'class':
+      return nextReply(snapshot);
+    case 'skip': case 'bunk': case 'budget':
+      return skipReply(snapshot, arg);
+    case 'standing': case 'total': case 'totals':
+      return standingReply(snapshot, arg);
+    case 'gpa': case 'cgpa': case 'sgpa': case 'results': case 'result':
+      return gpaReply(snapshot, arg);
+    case 'materials': case 'material': case 'files':
+      return materialsReply(snapshot, arg);
+    case 'get':
+      return await fileReply(snapshot, arg, { sendFile, quiet: true });
+    case 'file': case 'download':
+      return await fileReply(snapshot, arg, { sendFile, quiet: false });
+    case 'briefing': case 'brief': case 'morning':
+      return briefingText(snapshot, { doneState: state?.deadlines ?? {} })
+        ?? 'Nothing on today - no classes, nothing due, nothing to flag. No briefing would be sent.';
     case 'done':
       return markDone(snapshot, state?.deadlines ?? {}, raw).message;
     case 'login': case 'relogin':

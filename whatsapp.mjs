@@ -136,6 +136,19 @@ export async function connectWhatsApp({
     return res;
   }
 
+  // A file as a WhatsApp document, so it arrives with its real name and opens
+  // in the right app. The id is tracked like a text reply: our own document
+  // echoing back with its caption must not be read as a command.
+  async function sendDocument({ data, fileName, mimetype, caption }) {
+    if (!sock || !target) throw new Error('WhatsApp not connected yet');
+    const res = await sock.sendMessage(target, {
+      document: data, fileName, mimetype: mimetype || 'application/octet-stream', caption,
+    });
+    if (res?.key?.id) sentIds.add(res.key.id);
+    log('-> [file] ' + fileName + ' (' + Math.round(data.length / 1024) + ' KB)');
+    return res;
+  }
+
   // Replaces the socket in place. The previous one is torn down first -
   // leaving old listeners attached is what makes a reconnect loop spawn
   // endless QR codes.
@@ -214,7 +227,7 @@ export async function connectWhatsApp({
       }
       log('accepting commands from: ' + [...selfChat].join(', '));
       log(`connected as ${sock.user?.id} -> messaging ${target}`);
-      onReady?.({ send, jid: target });
+      onReady?.({ send, sendDocument, jid: target });
       return;
     }
 
@@ -294,5 +307,5 @@ export async function connectWhatsApp({
   }
 
   await start();
-  return { send, get jid() { return target; }, get sock() { return sock; } };
+  return { send, sendDocument, get jid() { return target; }, get sock() { return sock; } };
 }
